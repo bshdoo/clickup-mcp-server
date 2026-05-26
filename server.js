@@ -7,24 +7,26 @@ import { z } from 'zod';
 const API_KEY = process.env.CLICKUP_API_KEY;
 const TEAM_ID = process.env.CLICKUP_TEAM_ID;
 const PORT = parseInt(process.env.PORT || '3000', 10);
-const HOST = '0.0.0.0'; // Critical for Railway
+const HOST = '0.0.0.0';
 
 if (!API_KEY) { console.error('CLICKUP_API_KEY missing'); process.exit(1); }
 
-// ── ClickUp API ──────────────────────────────────────────────────
 async function cu(path, method = 'GET', body = null) {
   const res = await fetch(`https://api.clickup.com/api/v2${path}`, {
     method,
     headers: { Authorization: API_KEY, 'Content-Type': 'application/json' },
     ...(body ? { body: JSON.stringify(body) } : {}),
   });
-  if (!res.ok) throw new Error(`ClickUp ${res.status}: ${await res.text()}`);
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`ClickUp ${res.status}: ${text}`);
+  }
+  if (method === 'DELETE') return {};
   return res.json();
 }
 
-// ── MCP Server factory ───────────────────────────────────────────
 function buildServer() {
-  const s = new McpServer({ name: 'sheriff-clickup', version: '1.0.0' });
+  const s = new McpServer({ name: 'sheriff-clickup', version: '1.1.0' });
 
   s.tool('get_workspace', 'Get all spaces, folders and lists', {}, async () => {
     const { spaces = [] } = await cu(`/team/${TEAM_ID}/space?archived=false`);
@@ -90,6 +92,13 @@ function buildServer() {
     return { content: [{ type: 'text', text: `✅ Updated: ${t.name} [${t.status?.status}]` }] };
   });
 
+  s.tool('delete_task', 'Delete a task permanently', {
+    task_id: z.string(),
+  }, async ({ task_id }) => {
+    await cu(`/task/${task_id}`, 'DELETE');
+    return { content: [{ type: 'text', text: `✅ Deleted task ${task_id}` }] };
+  });
+
   s.tool('create_list', 'Create a list in a space or folder', {
     name: z.string(),
     space_id: z.string().optional(),
@@ -108,7 +117,7 @@ function buildServer() {
     return { content: [{ type: 'text', text: `✅ Folder: ${f.name} | ID: ${f.id}` }] };
   });
 
-  s.tool('get_members', 'Get all workspace members', {}, async () => {
+  s.tool('get_members', 'Get all workspace members with their IDs', {}, async () => {
     const { teams = [] } = await cu('/team');
     const members = teams.flatMap(t => (t.members || []).map(m => ({
       id: m.user.id, name: m.user.username, email: m.user.email,
@@ -121,13 +130,21 @@ function buildServer() {
     comment: z.string(),
   }, async ({ task_id, comment }) => {
     await cu(`/task/${task_id}/comment`, 'POST', { comment_text: comment });
-    return { content: [{ type: 'text', text: `✅ Comment added to ${task_id}` }] };
+    return { content: [{ type: 'text', text: `✅ Comment added` }] };
+  });
+
+  s.tool('search_tasks', 'Search tasks by keyword', {
+    query: z.string(),
+  }, async ({ query }) => {
+    const { tasks = [] } = await cu(`/team/${TEAM_ID}/task?query=${encodeURIComponent(query)}`);
+    return { content: [{ type: 'text', text: JSON.stringify(tasks.map(t => ({
+      id: t.id, name: t.name, status: t.status?.status, list: t.list?.name, url: t.url,
+    })), null, 2) }] };
   });
 
   return s;
 }
 
-// ── Express ──────────────────────────────────────────────────────
 const app = express();
 app.use(express.json());
 app.use((req, res, next) => {
@@ -138,11 +155,9 @@ app.use((req, res, next) => {
   next();
 });
 
-// Health
-app.get('/', (req, res) => res.json({ status: 'ok', service: 'Sheriff ClickUp MCP' }));
+app.get('/', (req, res) => res.json({ status: 'ok', service: 'Sheriff ClickUp MCP', version: '1.1.0' }));
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
-// Streamable HTTP — primary (for Claude.ai)
 app.post('/mcp', async (req, res) => {
   try {
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
@@ -156,28 +171,22 @@ app.post('/mcp', async (req, res) => {
   }
 });
 
-// SSE — legacy fallback
 const sseSessions = {};
 app.get('/sse', async (req, res) => {
   try {
     const transport = new SSEServerTransport('/messages', res);
     sseSessions[transport.sessionId] = transport;
     res.on('close', () => delete sseSessions[transport.sessionId]);
-    const server = buildServer();
-    await server.connect(transport);
-  } catch (e) {
-    console.error('SSE error:', e.message);
-  }
+    await buildServer().connect(transport);
+  } catch (e) { console.error('SSE error:', e.message); }
 });
 app.post('/messages', async (req, res) => {
-  const id = req.query.sessionId;
-  const t = sseSessions[id];
+  const t = sseSessions[req.query.sessionId];
   if (!t) return res.status(404).json({ error: 'Session not found' });
   await t.handlePostMessage(req, res);
 });
 
-// ── Start ────────────────────────────────────────────────────────
 app.listen(PORT, HOST, () => {
-  console.log(`🚀 Sheriff MCP on ${HOST}:${PORT}`);
-  console.log(`🔑 API Key: ${API_KEY ? 'set' : 'MISSING'} | Team: ${TEAM_ID || 'MISSING'}`);
+  console.log(`🚀 Sheriff MCP v1.1.0 on ${HOST}:${PORT}`);
+  console.log(`🔑 API: ${API_KEY ? 'set' : 'MISSING'} | Team: ${TEAM_ID || 'MISSING'}`);
 });
